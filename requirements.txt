@@ -1,0 +1,3 @@
+# IBM MQ Python bindings (successor to PyMQI). Requires IBM MQ C client 9.1+ on the machine.
+# See: https://github.com/ibm-messaging/mq-mqi-python
+ibmmq>=1.0.0

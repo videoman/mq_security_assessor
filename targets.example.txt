@@ -1,0 +1,4 @@
+# One target per line: host_or_ip:port
+# Lines starting with # are ignored.
+127.0.0.1:1414
+# mqdev.example.com:1415
