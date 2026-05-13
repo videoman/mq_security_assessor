@@ -1,0 +1,3 @@
+# user:password (password may contain ':' after the first colon). Merged with built-in defaults unless you pass --no-default-creds.
+svc_mq:ChangeMe!2025
+batchuser:batchsecret

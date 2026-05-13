@@ -9,8 +9,8 @@ Prerequisites:
 
 This tool is intended only for systems you own or are explicitly authorized to test.
 Cleartext passwords are not retrievable from a correctly configured queue manager; this
-script records identity and CHLAUTH metadata, and optionally validates supplied
-credentials from a file.
+script records identity and CHLAUTH metadata, and runs optional channel probes and
+credential checks (built-in defaults plus optional files).
 """
 
 from __future__ import annotations
@@ -39,6 +39,47 @@ except ImportError as exc:  # pragma: no cover - runtime guard
 
 _MQRC_NOT_AUTHORIZED = getattr(CMQC, "MQRC_NOT_AUTHORIZED", 2035)
 
+# Common IBM MQ sample / tutorial / weak SVRCONN-style names (authorized testing only).
+DEFAULT_SVRCONN_CHANNELS: tuple[str, ...] = (
+    "SYSTEM.DEF.SVRCONN",
+    "SYSTEM.ADMIN.SVRCONN",
+    "SYSTEM.AUTO.SVRCONN",
+    "DEV.APP.SVRCONN",
+    "DEV.ADMIN.SVRCONN",
+    "DEV.WMQ.SVRCONN",
+    "WMQ.SVRCONN",
+    "MQ.SVRCONN",
+    "ADMIN.SVRCONN",
+    "APP.SVRCONN",
+    "CLIENT.SVRCONN",
+    "CLIENT.CHANNEL",
+    "MY.SVRCONN",
+    "QM1.SVRCONN",
+    "DEFAULT.SVRCONN",
+    "CONNECTIONS",
+    "GUEST.SVRCONN",
+    "IBM.APP.SVRCONN",
+    "CLOUD.APP.SVRCONN",
+)
+
+# Typical IBM developer image / lab defaults (not exhaustive).
+DEFAULT_CREDENTIAL_PAIRS: tuple[tuple[str, str], ...] = (
+    ("app", "password"),
+    ("admin", "password"),
+    ("admin", "passw0rd"),
+    ("mqm", "mqm"),
+    ("mqm", ""),
+    ("mqm", "password"),
+    ("mqadmin", "mqadmin"),
+    ("mqadmin", "mqadmin!"),
+    ("mqadmin", "passw0rd"),
+    ("admin", "admin"),
+    ("guest", "guest"),
+    ("root", "root"),
+    ("mquser", "mquser"),
+    ("user", "user"),
+)
+
 
 @dataclass
 class Target:
@@ -62,6 +103,11 @@ class RunConfig:
     message_limit: int
     save_dir: Path
     spray_creds_path: Optional[Path]
+    channels_file: Optional[Path]
+    use_default_channels: bool
+    probe_channels: bool
+    use_default_creds: bool
+    credential_spray_enabled: bool
     start_service: Optional[str]
     acknowledge_service_risk: bool
 
@@ -355,11 +401,91 @@ def load_cred_pairs(path: Path) -> list[tuple[str, str]]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        if "#" in line:
+            line = line.split("#", 1)[0].strip()
         if ":" not in line:
             continue
         u, p = line.split(":", 1)
         pairs.append((u.strip(), p.strip()))
     return pairs
+
+
+def load_channel_names(path: Path) -> list[str]:
+    names: list[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "#" in line:
+            line = line.split("#", 1)[0].strip()
+        if line:
+            names.append(line)
+    return names
+
+
+def merge_channel_names(
+    *,
+    use_defaults: bool,
+    channels_file: Optional[Path],
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        key = name.upper()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(name)
+
+    if use_defaults:
+        for ch in DEFAULT_SVRCONN_CHANNELS:
+            add(ch)
+    if channels_file is not None:
+        for ch in load_channel_names(channels_file):
+            add(ch)
+    return out
+
+
+def merge_cred_pairs(
+    *,
+    use_defaults: bool,
+    creds_file: Optional[Path],
+) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_pair(user: str, password: str) -> None:
+        key = (user, password)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(key)
+
+    if use_defaults:
+        for u, p in DEFAULT_CREDENTIAL_PAIRS:
+            add_pair(u, p)
+    if creds_file is not None:
+        for u, p in load_cred_pairs(creds_file):
+            add_pair(u, p)
+    return out
+
+
+def probe_channel_connect(
+    queue_manager: str,
+    conn_info: str,
+    channel: str,
+    user: Optional[str],
+    password: Optional[str],
+) -> dict[str, Any]:
+    try:
+        q = connect_qmgr(queue_manager, channel, conn_info, user, password)
+        q.disconnect()
+        return {"channel": channel, "ok": True}
+    except mq.MQMIError as e:
+        return {"channel": channel, "ok": False, "comp": e.comp, "reason": e.reason}
+    except Exception as e:  # noqa: BLE001
+        return {"channel": channel, "ok": False, "error": type(e).__name__, "detail": fmt_exc(e)}
 
 
 def try_connect_with_creds(
@@ -372,11 +498,23 @@ def try_connect_with_creds(
     try:
         q = connect_qmgr(queue_manager, channel, conn_info, user, password)
         q.disconnect()
-        return {"user": user, "ok": True}
+        return {"user": user, "password_tried": "(redacted)", "ok": True}
     except mq.MQMIError as e:
-        return {"user": user, "ok": False, "comp": e.comp, "reason": e.reason}
+        return {
+            "user": user,
+            "password_tried": "(redacted)",
+            "ok": False,
+            "comp": e.comp,
+            "reason": e.reason,
+        }
     except Exception as e:  # noqa: BLE001
-        return {"user": user, "ok": False, "error": type(e).__name__, "detail": fmt_exc(e)}
+        return {
+            "user": user,
+            "password_tried": "(redacted)",
+            "ok": False,
+            "error": type(e).__name__,
+            "detail": fmt_exc(e),
+        }
 
 
 def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
@@ -393,8 +531,53 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
         "timestamps": {"started": dt.datetime.now(dt.UTC).isoformat()},
     }
 
-    qmgr = connect_qmgr(cfg.queue_manager, cfg.channel, conn_info, cfg.user, cfg.password)
+    merged_channels = merge_channel_names(
+        use_defaults=cfg.use_default_channels,
+        channels_file=cfg.channels_file,
+    )
+    report["channel_probe_settings"] = {
+        "probe_enabled": cfg.probe_channels,
+        "use_builtin_channel_list": cfg.use_default_channels,
+        "channels_file": str(cfg.channels_file) if cfg.channels_file else None,
+        "channels_to_try": len(merged_channels),
+    }
+
+    if cfg.probe_channels and merged_channels:
+        report["channel_connection_probe"] = [
+            probe_channel_connect(cfg.queue_manager, conn_info, ch, cfg.user, cfg.password)
+            for ch in merged_channels
+        ]
+    else:
+        report["channel_connection_probe"] = {
+            "skipped": True,
+            "reason": "Disabled or no channel names after merge (use defaults and/or --channels-file).",
+        }
+
+    cred_pairs = merge_cred_pairs(
+        use_defaults=cfg.use_default_creds,
+        creds_file=cfg.spray_creds_path,
+    )
+    report["credential_spray_settings"] = {
+        "enabled": cfg.credential_spray_enabled,
+        "use_builtin_pairs": cfg.use_default_creds,
+        "creds_file": str(cfg.spray_creds_path) if cfg.spray_creds_path else None,
+        "pairs_to_try": len(cred_pairs),
+        "channel_used": cfg.channel,
+    }
+
+    if cfg.credential_spray_enabled and cred_pairs:
+        report["credential_spray"] = [
+            try_connect_with_creds(cfg.queue_manager, cfg.channel, conn_info, u, p) for u, p in cred_pairs
+        ]
+    else:
+        report["credential_spray"] = {
+            "skipped": True,
+            "reason": "Disabled (--no-credential-spray) or no pairs (enable defaults and/or --spray-creds).",
+        }
+
+    qmgr = None
     try:
+        qmgr = connect_qmgr(cfg.queue_manager, cfg.channel, conn_info, cfg.user, cfg.password)
         report["queue_manager_attributes"] = qmgr_version_block(qmgr)
         pcf = mq.PCFExecute(qmgr, response_wait_interval=30_000)
 
@@ -422,12 +605,6 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
                 }
             else:
                 report["start_service"] = start_service_probe(pcf, cfg.start_service)
-
-        if cfg.spray_creds_path:
-            pairs = load_cred_pairs(cfg.spray_creds_path)
-            report["credential_spray"] = [
-                try_connect_with_creds(cfg.queue_manager, cfg.channel, conn_info, u, p) for u, p in pairs
-            ]
 
         msg_section: dict[str, Any] = {}
         if cfg.message_queue and cfg.message_ops:
@@ -463,11 +640,22 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
                 else:
                     msg_section[key] = {"error": f"Unknown message op {op!r}"}
         report["messages"] = msg_section
+        report["primary_connection"] = {"ok": True, "channel": cfg.channel}
+    except mq.MQMIError as e:
+        report["primary_connection"] = {
+            "ok": False,
+            "comp": e.comp,
+            "reason": e.reason,
+            "detail": fmt_exc(e),
+        }
+    except Exception as e:  # noqa: BLE001
+        report["primary_connection"] = {"ok": False, "error": type(e).__name__, "detail": fmt_exc(e)}
     finally:
-        try:
-            qmgr.disconnect()
-        except Exception:
-            pass
+        if qmgr is not None:
+            try:
+                qmgr.disconnect()
+            except Exception:
+                pass
 
     report["timestamps"]["finished"] = dt.datetime.now(dt.UTC).isoformat()
     return report
@@ -492,6 +680,7 @@ def queue_types_from_choice(choice: str) -> list[int]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="IBM MQ assessment helper using ibmmq (mq-mqi-python).")
     p.add_argument("--targets", type=Path, required=True, help="File of host:port lines.")
     p.add_argument("--output-dir", type=Path, default=Path("reports"), help="Directory for per-host reports.")
     p.add_argument("--queue-manager", default=os.environ.get("MQ_QMGR", "QM1"))
@@ -521,9 +710,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory for binary captures when using save.",
     )
     p.add_argument(
+        "--channels-file",
+        type=Path,
+        help="Extra channel names to try (one per line); merged with built-in defaults unless disabled.",
+    )
+    p.add_argument(
+        "--no-default-channels",
+        action="store_true",
+        help="Do not use built-in channel name list; use only --channels-file (if set).",
+    )
+    p.add_argument(
+        "--no-probe-channels",
+        action="store_true",
+        help="Skip trying each channel name for a client connection.",
+    )
+    p.add_argument(
         "--spray-creds",
         type=Path,
-        help="Optional file of user:password lines to test against the SVRCONN channel.",
+        help="File of user:password lines (password may contain ':'); merged with built-in default pairs unless disabled.",
+    )
+    p.add_argument(
+        "--no-default-creds",
+        action="store_true",
+        help="Do not use built-in username:password pairs; use only --spray-creds file (if set).",
+    )
+    p.add_argument(
+        "--no-credential-spray",
+        action="store_true",
+        help="Disable all credential connection attempts (built-in list and file).",
     )
     p.add_argument(
         "--start-service",
@@ -554,6 +768,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         message_limit=max(1, args.message_limit),
         save_dir=args.save_dir,
         spray_creds_path=args.spray_creds,
+        channels_file=args.channels_file,
+        use_default_channels=not args.no_default_channels,
+        probe_channels=not args.no_probe_channels,
+        use_default_creds=not args.no_default_creds,
+        credential_spray_enabled=not args.no_credential_spray,
         start_service=args.start_service,
         acknowledge_service_risk=bool(args.i_accept_service_exec_risk),
     )

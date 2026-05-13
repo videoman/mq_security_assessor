@@ -1,0 +1,3 @@
+# One SVRCONN-style channel name per line. Merged with built-in defaults unless you pass --no-default-channels.
+MY.CUSTOM.SVRCONN
+PARTNER.CHANNEL
