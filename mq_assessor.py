@@ -9,8 +9,8 @@ Prerequisites:
 
 This tool is intended only for systems you own or are explicitly authorized to test.
 Cleartext passwords are not retrievable from a correctly configured queue manager; this
-script records identity and CHLAUTH metadata, and runs optional channel probes and
-credential checks (built-in defaults plus optional files).
+script records identity and CHLAUTH metadata, and writes credential spray attempts (including
+passwords you configure) into each host report so successful pairs are visible.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
     import ibmmq as mq
@@ -110,6 +110,9 @@ class RunConfig:
     credential_spray_enabled: bool
     start_service: Optional[str]
     acknowledge_service_risk: bool
+    console: bool
+    color: str
+    console_max_items: int
 
 
 def parse_targets(path: Path) -> list[Target]:
@@ -136,6 +139,121 @@ def safe_report_basename(host: str, port: int) -> str:
 
 def fmt_exc(e: BaseException) -> str:
     return "".join(traceback.format_exception_only(type(e), e)).strip()
+
+
+class MsfConsole:
+    """Metasploit-style status lines for STDOUT ([*] info, [+] win, [-] miss, [!] warn)."""
+
+    RESET = "\033[0m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+
+    def __init__(self, *, enabled: bool, color: str) -> None:
+        self.enabled = enabled
+        if not enabled:
+            self._color = False
+            return
+        if color == "always":
+            self._color = True
+        elif color == "never":
+            self._color = False
+        else:
+            self._color = sys.stdout.isatty()
+
+    def _paint(self, code: str, text: str) -> str:
+        if not self._color:
+            return text
+        return f"{code}{text}{self.RESET}"
+
+    def _emit(self, bracket: str, msg: str, code: str) -> None:
+        if not self.enabled:
+            return
+        prefix = self._paint(code, bracket) if self._color else bracket
+        print(f"{prefix} {msg}", flush=True)
+
+    def info(self, msg: str) -> None:
+        self._emit("[*]", msg, self.CYAN)
+
+    def good(self, msg: str) -> None:
+        self._emit("[+]", msg, self.GREEN)
+
+    def bad(self, msg: str) -> None:
+        self._emit("[-]", msg, self.RED)
+
+    def warn(self, msg: str) -> None:
+        self._emit("[!]", msg, self.YELLOW)
+
+    def sub(self, msg: str) -> None:
+        """Indented detail line (no bracket)."""
+        if not self.enabled:
+            return
+        line = f"    {msg}"
+        print(self._paint("\033[90m", line) if self._color else line, flush=True)
+
+
+def _pcf_row_get(row: dict[str, Any], const: int) -> Any:
+    return row.get(str(const), row.get(const))
+
+
+def _row_channel_name(row: dict[str, Any]) -> Optional[str]:
+    v = _pcf_row_get(row, mq.CMQCFC.MQCACH_CHANNEL_NAME)
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _row_queue_name(row: dict[str, Any]) -> Optional[str]:
+    v = _pcf_row_get(row, CMQC.MQCA_Q_NAME)
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _chlauth_console_line(rec: dict[str, Any]) -> str:
+    parts: list[str] = []
+    pairs: list[tuple[str, int]] = [
+        ("ch", mq.CMQCFC.MQCACH_CHANNEL_NAME),
+        ("client", mq.CMQCFC.MQCACH_CLIENT_USER_OR_NONE),
+        ("conn", mq.CMQCFC.MQCACH_CONNECTION_NAME),
+        ("mcauser", mq.CMQCFC.MQCACH_MCA_USER_ID),
+    ]
+    for label, const in pairs:
+        v = _pcf_row_get(rec, const)
+        if v is not None and str(v).strip():
+            parts.append(f"{label}={to_jsonable(v)}")
+    if not parts:
+        blob = json.dumps({k: to_jsonable(v) for k, v in rec.items()}, sort_keys=True)
+        return blob[:240] + ("..." if len(blob) > 240 else "")
+    return " ".join(parts)
+
+
+def _print_named_rows(
+    con: MsfConsole,
+    label: str,
+    rows: list[dict[str, Any]],
+    name_fn: Callable[[dict[str, Any]], Optional[str]],
+    host: str,
+    port: int,
+    max_items: int,
+) -> None:
+    names: list[str] = []
+    for r in rows:
+        n = name_fn(r)
+        if n:
+            names.append(n)
+    con.info(f"{host}:{port} — {label}: {len(names)} object(s) from PCF inquire")
+    if not names:
+        return
+    limit = max(1, max_items)
+    shown = names[:limit]
+    for n in shown:
+        con.good(f"{label}: {n}")
+    if len(names) > limit:
+        con.warn(f"{label}: ... and {len(names) - limit} more (see report file; console cap {limit})")
 
 
 def to_jsonable(obj: Any) -> Any:
@@ -498,11 +616,11 @@ def try_connect_with_creds(
     try:
         q = connect_qmgr(queue_manager, channel, conn_info, user, password)
         q.disconnect()
-        return {"user": user, "password_tried": "(redacted)", "ok": True}
+        return {"user": user, "password": password, "ok": True}
     except mq.MQMIError as e:
         return {
             "user": user,
-            "password_tried": "(redacted)",
+            "password": password,
             "ok": False,
             "comp": e.comp,
             "reason": e.reason,
@@ -510,26 +628,29 @@ def try_connect_with_creds(
     except Exception as e:  # noqa: BLE001
         return {
             "user": user,
-            "password_tried": "(redacted)",
+            "password": password,
             "ok": False,
             "error": type(e).__name__,
             "detail": fmt_exc(e),
         }
 
 
-def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
+def assess_target(cfg: RunConfig, t: Target, con: MsfConsole) -> dict[str, Any]:
     conn_info = f"{t.host}({t.port})"
     report: dict[str, Any] = {
         "target": {"host": t.host, "port": t.port, "conn_info": conn_info},
         "queue_manager": cfg.queue_manager,
         "channel": cfg.channel,
         "identity": {
-            "note": "IBM MQ does not expose cleartext passwords over MQI/PCF. "
-            "Review CHLAUTH records and optional credential spray results below.",
+            "note": "IBM MQ does not expose stored cleartext passwords over MQI/PCF. "
+            "The credential_spray section records each user:password you supplied (or from built-in defaults) "
+            "in plaintext so you can see which pair connected successfully; protect report files accordingly.",
             "csp_user": cfg.user,
         },
         "timestamps": {"started": dt.datetime.now(dt.UTC).isoformat()},
     }
+
+    con.info(f"{t.host}:{t.port} — session: QMGR={cfg.queue_manager!r} primary_channel={cfg.channel!r} conn={conn_info}")
 
     merged_channels = merge_channel_names(
         use_defaults=cfg.use_default_channels,
@@ -543,15 +664,23 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
     }
 
     if cfg.probe_channels and merged_channels:
-        report["channel_connection_probe"] = [
-            probe_channel_connect(cfg.queue_manager, conn_info, ch, cfg.user, cfg.password)
-            for ch in merged_channels
-        ]
+        con.info(f"{t.host}:{t.port} — probing {len(merged_channels)} channel name(s) for client TCP/MQI acceptance...")
+        probe_results: list[dict[str, Any]] = []
+        ok_ch = 0
+        for ch in merged_channels:
+            r = probe_channel_connect(cfg.queue_manager, conn_info, ch, cfg.user, cfg.password)
+            probe_results.append(r)
+            if r.get("ok"):
+                ok_ch += 1
+                con.good(f"{t.host}:{t.port} — CLIENT CONNECT OK — channel={ch!r}")
+        report["channel_connection_probe"] = probe_results
+        con.info(f"{t.host}:{t.port} — channel probe summary: {ok_ch}/{len(merged_channels)} name(s) accepted a client connection")
     else:
         report["channel_connection_probe"] = {
             "skipped": True,
             "reason": "Disabled or no channel names after merge (use defaults and/or --channels-file).",
         }
+        con.warn(f"{t.host}:{t.port} — channel probe skipped ({report['channel_connection_probe']['reason']})")
 
     cred_pairs = merge_cred_pairs(
         use_defaults=cfg.use_default_creds,
@@ -566,25 +695,72 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
     }
 
     if cfg.credential_spray_enabled and cred_pairs:
-        report["credential_spray"] = [
-            try_connect_with_creds(cfg.queue_manager, cfg.channel, conn_info, u, p) for u, p in cred_pairs
-        ]
+        con.info(
+            f"{t.host}:{t.port} — credential spray: {len(cred_pairs)} pair(s) "
+            f"against channel={cfg.channel!r}"
+        )
+        spray_rows: list[dict[str, Any]] = []
+        ok_cred = 0
+        for u, pw in cred_pairs:
+            row = try_connect_with_creds(cfg.queue_manager, cfg.channel, conn_info, u, pw)
+            spray_rows.append(row)
+            if row.get("ok"):
+                ok_cred += 1
+                con.good(f"{t.host}:{t.port} — VALID CREDENTIALS — {u!r} / {pw!r} (SVRCONN={cfg.channel!r})")
+        report["credential_spray"] = spray_rows
+        con.info(f"{t.host}:{t.port} — credential spray summary: {ok_cred}/{len(cred_pairs)} pair(s) succeeded")
     else:
         report["credential_spray"] = {
             "skipped": True,
             "reason": "Disabled (--no-credential-spray) or no pairs (enable defaults and/or --spray-creds).",
         }
+        con.warn(f"{t.host}:{t.port} — credential spray skipped")
 
     qmgr = None
     try:
+        con.info(f"{t.host}:{t.port} — primary connection using channel={cfg.channel!r} ...")
         qmgr = connect_qmgr(cfg.queue_manager, cfg.channel, conn_info, cfg.user, cfg.password)
         report["queue_manager_attributes"] = qmgr_version_block(qmgr)
+        con.good(
+            f"{t.host}:{t.port} — primary MQ session established — "
+            f"attrs={json.dumps(to_jsonable(report['queue_manager_attributes']), sort_keys=True)}"
+        )
         pcf = mq.PCFExecute(qmgr, response_wait_interval=30_000)
 
         report["channels"] = enumerate_channels(pcf, cfg.channel_pattern)
+        _print_named_rows(
+            con,
+            "ENUM CHANNEL",
+            report["channels"],
+            _row_channel_name,
+            t.host,
+            t.port,
+            cfg.console_max_items,
+        )
+
         report["queues"] = enumerate_queues(pcf, cfg.queue_pattern, cfg.queue_types)
+        _print_named_rows(
+            con,
+            "ENUM QUEUE (name)",
+            report["queues"],
+            _row_queue_name,
+            t.host,
+            t.port,
+            cfg.console_max_items,
+        )
+
         try:
             report["connections"] = enumerate_connections(pcf)
+            if isinstance(report["connections"], list):
+                con.info(f"{t.host}:{t.port} — active connections: {len(report['connections'])}")
+                for i, c in enumerate(report["connections"][: cfg.console_max_items]):
+                    tag = _pcf_row_get(c, mq.CMQCFC.MQCACF_APPL_TAG)
+                    con.good(f"CONNECTION — appl={to_jsonable(tag)}")
+                if len(report["connections"]) > cfg.console_max_items:
+                    con.warn(
+                        f"{t.host}:{t.port} — connections list truncated at console "
+                        f"({cfg.console_max_items} of {len(report['connections'])})"
+                    )
         except mq.MQMIError as e:
             report["connections"] = {
                 "error": "MQMIError",
@@ -592,10 +768,39 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
                 "reason": e.reason,
                 "detail": fmt_exc(e),
             }
+            con.bad(f"{t.host}:{t.port} — inquire connections failed: {fmt_exc(e)}")
         except Exception as e:  # noqa: BLE001
             report["connections"] = {"error": type(e).__name__, "detail": fmt_exc(e)}
+            con.bad(f"{t.host}:{t.port} — inquire connections error: {fmt_exc(e)}")
+
         report["chlauth_records"] = enumerate_chlauth(pcf, "*")
+        if report["chlauth_records"]:
+            con.info(f"{t.host}:{t.port} — CHLAUTH records: {len(report['chlauth_records'])}")
+            for rec in report["chlauth_records"][: cfg.console_max_items]:
+                con.good(f"CHLAUTH — {_chlauth_console_line(rec)}")
+            if len(report["chlauth_records"]) > cfg.console_max_items:
+                con.warn(
+                    f"{t.host}:{t.port} — CHLAUTH truncated on console "
+                    f"({cfg.console_max_items} of {len(report['chlauth_records'])})"
+                )
+        else:
+            con.info(f"{t.host}:{t.port} — CHLAUTH: none returned (or not authorized)")
+
         report["services"] = enumerate_services(pcf, "*")
+        svc_key = getattr(CMQC, "MQCA_SERVICE_NAME", None)
+        if isinstance(report["services"], list) and svc_key is not None:
+            con.info(f"{t.host}:{t.port} — services: {len(report['services'])}")
+            for s in report["services"][: cfg.console_max_items]:
+                if isinstance(s, dict) and "error" not in s:
+                    nm = _pcf_row_get(s, svc_key)
+                    if nm:
+                        con.good(f"SERVICE — {to_jsonable(nm)}")
+        elif isinstance(report["services"], list) and report["services"]:
+            err0 = report["services"][0]
+            if isinstance(err0, dict) and err0.get("error"):
+                con.warn(f"{t.host}:{t.port} — SERVICE inquire unavailable: {err0.get('error')}")
+            else:
+                con.info(f"{t.host}:{t.port} — services: {len(report['services'])} object(s) (see report)")
 
         if cfg.start_service:
             if not cfg.acknowledge_service_risk:
@@ -603,8 +808,13 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
                     "skipped": True,
                     "reason": "Refusing MQCMD_START_SERVICE without --i-accept-service-exec-risk",
                 }
+                con.warn(f"{t.host}:{t.port} — start_service skipped (risk flag not set)")
             else:
                 report["start_service"] = start_service_probe(pcf, cfg.start_service)
+                if report["start_service"].get("ok"):
+                    con.warn(f"{t.host}:{t.port} — START_SERVICE returned OK for {cfg.start_service!r}")
+                else:
+                    con.bad(f"{t.host}:{t.port} — START_SERVICE failed: {report['start_service']}")
 
         msg_section: dict[str, Any] = {}
         if cfg.message_queue and cfg.message_ops:
@@ -639,6 +849,7 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
                     )
                 else:
                     msg_section[key] = {"error": f"Unknown message op {op!r}"}
+                con.info(f"{t.host}:{t.port} — message op {key!r} on queue={cfg.message_queue!r} completed")
         report["messages"] = msg_section
         report["primary_connection"] = {"ok": True, "channel": cfg.channel}
     except mq.MQMIError as e:
@@ -648,8 +859,10 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
             "reason": e.reason,
             "detail": fmt_exc(e),
         }
+        con.bad(f"{t.host}:{t.port} — primary connection FAILED: {fmt_exc(e)}")
     except Exception as e:  # noqa: BLE001
         report["primary_connection"] = {"ok": False, "error": type(e).__name__, "detail": fmt_exc(e)}
+        con.bad(f"{t.host}:{t.port} — primary session error: {fmt_exc(e)}")
     finally:
         if qmgr is not None:
             try:
@@ -658,6 +871,7 @@ def assess_target(cfg: RunConfig, t: Target) -> dict[str, Any]:
                 pass
 
     report["timestamps"]["finished"] = dt.datetime.now(dt.UTC).isoformat()
+    con.info(f"{t.host}:{t.port} — host pass complete (report file written separately)")
     return report
 
 
@@ -748,6 +962,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Required alongside --start-service.",
     )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable Metasploit-style progress output on STDOUT (reports are still written).",
+    )
+    p.add_argument(
+        "--color",
+        choices=("auto", "never", "always"),
+        default="auto",
+        help="ANSI colors for console output (default: auto when STDOUT is a TTY).",
+    )
+    p.add_argument(
+        "--console-max-items",
+        type=int,
+        default=200,
+        metavar="N",
+        help="Max lines per category (channels, queues, CHLAUTH, etc.) on STDOUT.",
+    )
     return p
 
 
@@ -775,23 +1007,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         credential_spray_enabled=not args.no_credential_spray,
         start_service=args.start_service,
         acknowledge_service_risk=bool(args.i_accept_service_exec_risk),
+        console=not args.quiet,
+        color=args.color,
+        console_max_items=max(1, args.console_max_items),
     )
 
     targets = parse_targets(cfg.targets_path)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
+    con = MsfConsole(enabled=cfg.console, color=cfg.color)
+
     print("Authorized-use reminder: run only against queue managers you own or are permitted to test.")
     for t in targets:
         out_path = cfg.output_dir / safe_report_basename(t.host, t.port)
-        print(f"Assessing {t.host}:{t.port} -> {out_path}")
+        con.info(f"Writing report to {out_path}")
         try:
-            data = assess_target(cfg, t)
+            data = assess_target(cfg, t, con)
         except Exception as e:  # noqa: BLE001
             data = {
                 "target": {"host": t.host, "port": t.port},
                 "fatal": type(e).__name__,
                 "detail": traceback.format_exc(),
             }
+            con.bad(f"{t.host}:{t.port} — fatal: {type(e).__name__}: {e}")
         out_path.write_text(render_text_report(data), encoding="utf-8")
     return 0
 
